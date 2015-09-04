@@ -1,13 +1,14 @@
 #!/usr/bin/env python
 
 import os
+import re
 import json
 import argparse
 import BaseHTTPServer
 import shlex
 import subprocess
-import shutil
 import logging
+import threading
 
 logger = logging.getLogger('gitlab-webhook-processor')
 logger.setLevel(logging.DEBUG)
@@ -17,19 +18,25 @@ logging_handler.setFormatter(
                       "%B %d %H:%M:%S"))
 logger.addHandler(logging_handler)
 
-repository = ''
-branch_dir = ''
+# We want to allow any repository from a trusted host
+repo_host = ''
+repo_dir = ''
+hooks_to_handle = {"tag_push"}
+
 
 class RequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
     def do_POST(self):
         logger.info("Received POST request.")
         self.rfile._sock.settimeout(5)
-        
-        if not self.headers.has_key('Content-Length'):
+
+        if 'Content-Length' not in self.headers:
+            logger.debug("No Content-Length header in request")
             return self.error_response()
-        
+
         json_data = self.rfile.read(
             int(self.headers['Content-Length'])).decode('utf-8')
+
+        logger.debug("Request Data: %s" % json_data)
 
         try:
             data = json.loads(json_data)
@@ -37,82 +44,84 @@ class RequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             logger.error("Unable to load JSON data '%s'" % json_data)
             return self.error_response()
 
-        data_repository = data.get('repository', {}).get('url')
-        if data_repository == repository:
-            branch_to_update = data.get('ref', '').split('refs/heads/')[-1]
-            branch_to_update = branch_to_update.replace('; ', '')
-            if branch_to_update == '':
-                logger.error("Unable to identify branch to update: '%s'" %
-                             data.get('ref', ''))
-                return self.error_response()
-            elif (branch_to_update.find("/") != -1 or
-                  branch_to_update in ['.', '..']):
-                # Avoid feature branches, malicious branches and similar.
-                logger.debug("Skipping update for branch '%s'." %
-                             branch_to_update)
-            else:
-                self.ok_response()
-                branch_deletion = data['after'].replace('0', '') == ''
-                branch_addition = data['before'].replace('0', '') == ''
-                if branch_addition:
-                    self.add_branch(branch_to_update)
-                elif branch_deletion:
-                    self.remove_branch(branch_to_update)
-                else:
-                    self.update_branch(branch_to_update)
-                self.post_install(branch_to_update)
-                return 
-        else:
-            logger.debug(("Repository '%s' is not our repository '%s'. "
-                          "Ignoring.") % (data_repository, repository))
+        hook_type = data.get('object_kind')
+        if hook_type not in hooks_to_handle:
+            logger.error("Unsupported hook type: %s" % hook_type)
+            return self.error_response()
 
+        repo_url = data.get('repository', {}).get('git_ssh_url')
+        try:
+            _, host, path = get_ssh_url_parts(repo_url)
+            if host != repo_host:
+                logger.error("Repo url %s doesn't match allowed host %s"
+                             % (repo_url, repo_host))
+                return self.error_response()
+        except Exception:
+            logger.exception("Exception while checking repo_url %s" % e)
+            return self.error_response()
+            
+        repo_name = path.split('/')[-1].split('.', 1)[0]
+
+        tag = data.get('ref', '').split('refs/tags/')[-1]
+        if tag == '':
+            logger.error("Unable to identify tag: '%s'" % data.get('ref', ''))
+            return self.error_response()
+        elif not repo_name or '/' in repo_name or repo_name in ['.', '..']:
+            # Avoid feature branches, malicious branches and similar.
+            logger.debug("Skipping update for repo '%s'." % repo_name)
+            return self.error_response()
+
+        # We are gonna leak repositories, but that isn't that big of a
+        # deal since we are gonna re-use repositories for each tag.
+        tag_addition = data['before'].replace('0', '') == ''
+        tag_deletion = data['after'].replace('0', '') == ''
+
+        post_tag_thread = threading.Thread(target=self.post_tag,
+                                           args=(repo_name, tag))
+        if tag_addition:
+            self.add_repo(repo_url, repo_name, tag)
+            post_tag_thread.start()
+        elif tag_deletion:
+            self.ok_response()
+        else:
+            self.update_repo(repo_url, repo_name, tag)
+            post_tag_thread.start()
         self.ok_response()
         logger.info("Finished processing POST request.")
 
-    def add_branch(self, branch):
-        os.chdir(branch_dir)
-        branch_path = os.path.join(branch_dir, branch)
-        if os.path.isdir(branch_path):
-            return self.update_branch(branch_path)
+    def add_repo(self, url, repo, tag):
+        os.chdir(repo_dir)
+        repo_path = os.path.join(repo_dir, repo)
+        if os.path.isdir(repo_path):
+            return self.update_repo(url, repo, tag)
         run_command("git clone --depth 1 -o origin -b %s %s %s" %
-                    (branch, repository, branch))
-        os.chmod(branch_path, 0770)
-        logger.info("Added directory '%s'" % branch_path)
+                    (tag, url, repo_path))
+        os.chmod(repo_path, 0770)
+        logger.info("Added directory '%s'" % repo_path)
 
-    def update_branch(self, branch):
-        branch_path = os.path.join(branch_dir, branch)
-        if not os.path.isdir(branch_path):
-            return self.add_branch(branch)
-        os.chdir(branch_path)
-        run_command("git checkout -f %s" % branch)
-        run_command("git clean -fdx")
-        run_command("git fetch origin %s" % branch)
+    def update_repo(self, url, repo, tag):
+        repo_path = os.path.join(repo_dir, repo)
+        if not os.path.isdir(repo_path):
+            return self.add_branch(url, repo, tag)
+        os.chdir(repo_path)
+        # We want to preserve buid artifacts for performance reasons
+        run_command("git clean -f")
+        run_command("git fetch origin tags/%s" % tag)
+        run_command("git checkout --detach FETCH_HEAD")
         run_command("git reset --hard FETCH_HEAD")
-        logger.info("Updated branch '%s'" % branch_path)
-        
-    def remove_branch(self, branch):
-        branch_path = os.path.join(branch_dir, branch)
-        if not os.path.isdir(branch_path):
-            logger.warn("Directory to remove does not exist: %s" % branch_path)
-            return
-        try:
-            shutil.rmtree(branch_path)
-        except (OSError, IOError), e:
-            logger.exception("Error removing directory '%s'" % branch_path)
-        else:
-            logger.info("Removed directory '%s'" % branch_path)
-        
+        logger.info("Updated repo '%s' to tag '%s'" % (repo, tag))
+
     def ok_response(self):
         self.send_response(200)
         self.send_header("Content-type", "text/plain")
         self.end_headers()
 
-    def post_install(self, branch):
-        script = "%s/%s/postinstall" % (branch_dir, branch)
+    def post_tag(self, repo, tag):
+        script = "%s/%s/post-tag" % (repo_dir, repo)
         if os.path.isfile(script):
             if os.access(script, os.X_OK):
-                logger.info("Running post-install script: %s" % script)
-                run_command(script)
+                logger.info("Running post-tag script: %s" % script)
+                run_command('%s "%s"' % (script, tag))
             else:
                 logger.error("Post-install script is not executable: %s" %
                              script)
@@ -122,6 +131,7 @@ class RequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         self.send_response(400)
         self.send_header("Content-type", "text/plain")
         self.end_headers()
+
 
 def run_command(command):
     logger.debug("Running command: %s" % command)
@@ -134,27 +144,35 @@ def run_command(command):
                      (command, process.returncode, process.stdout.read()))
         return ''
     return process.stdout.read()
-        
+
+def get_ssh_url_parts(url):
+    pattern = r'^([^@]+)@([^:]+):(.+)$'
+    result = re.match(pattern, url)
+    if not result:
+        return result
+    return result.groups()
+
 def get_arguments():
     parser = argparse.ArgumentParser(description=(
-            'Deploy Gitlab branches in repository to a directory.'))
-    parser.add_argument('repository', help=(
-            'repository location. Example: git@gitlab.company.com:repo'))
-    parser.add_argument('branch_dir', help=(
-            'directory to clone branches to. Example: /opt/repo'))
+        'Deploy tags based on GitLab tag webhook'))
+    parser.add_argument('repo_host', help=(
+        'Trusted repository remote host. Example: gitlab.example.com'))
+    parser.add_argument('repo_dir', help=(
+        'directory to clone the repos to. Example: /opt/repos'))
     parser.add_argument('-p', '--port', default=8000, metavar='8000',
                         help='server address (host:port). host is optional.')
     return parser.parse_args()
 
+
 def main():
-    global repository
-    global branch_dir
-    
+    global repo_host
+    global repo_dir
+
     args = get_arguments()
-    repository = args.repository
-    branch_dir = os.path.abspath(os.path.expanduser(args.branch_dir))
+    repo_dir = os.path.abspath(os.path.expanduser(args.repo_dir))
+    repo_host = args.repo_host
     address = str(args.port)
-    
+
     if address.find(':') == -1:
         host = '0.0.0.0'
         port = int(address)
@@ -170,6 +188,7 @@ def main():
         pass
     logger.info("Stopping HTTP Server.")
     server.server_close()
-    
+
+
 if __name__ == '__main__':
     main()
